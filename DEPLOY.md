@@ -68,6 +68,27 @@ Ghi lại: thời gian/clip ở 768p, peak VRAM, số steps, danh sách custom n
 
 ---
 
+## Chọn base image theo GPU — đọc trước khi build
+
+`Dockerfile` mặc định dùng `runpod/worker-comfyui:5.8.5-base-cuda12.8.1`.
+
+| GPU | Base image | Vì sao |
+|---|---|---|
+| RTX 5090 (Blackwell, sm_120) | `5.8.5-base-cuda12.8.1` | **Bắt buộc.** CUDA 12.6 không có kernel cho sm_120 — worker sẽ crash với `no kernel image is available for execution` ngay lúc nạp model |
+| L40S / A6000 / A100 / H100 | `5.8.5-base` (CUDA 12.6) | Nhẹ hơn ~6GB, build nhanh hơn |
+
+Đổi bằng cách sửa `ARG WORKER_COMFYUI_TAG` trong `Dockerfile`, hoặc truyền lúc build.
+
+Bản `cuda12.8.1` nặng ~17GB. Nếu Actions fail với `no space left on device` dù đã có bước dọn đĩa, chuyển sang build ngay trên Pod tạm ở giai đoạn 1 (mạng datacenter nhanh, đĩa rộng):
+
+```bash
+docker build -t ghcr.io/<user>/h3-worker:manual .
+echo $GHCR_TOKEN | docker login ghcr.io -u <user> --password-stdin
+docker push ghcr.io/<user>/h3-worker:manual
+```
+
+---
+
 ## Giai đoạn 2 — Mở public cho package trên ghcr
 
 Package trên ghcr mặc định là **private**. RunPod pull private image sẽ fail với lỗi `unauthorized` mà không nói rõ nguyên nhân.

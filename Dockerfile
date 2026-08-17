@@ -3,9 +3,15 @@
 #  Base: runpod/worker-comfyui — đã có sẵn ComfyUI + comfy-cli + runpod SDK
 #  Ta chỉ override /handler.py bằng bản hiểu VIDEO và upload thẳng lên R2.
 # =============================================================================
-# Kiểm tra tag mới nhất tại: https://hub.docker.com/r/runpod/worker-comfyui/tags
-ARG WORKER_COMFYUI_VERSION=5.4.0
-FROM runpod/worker-comfyui:${WORKER_COMFYUI_VERSION}-base
+# QUAN TRỌNG — chọn đúng biến thể CUDA theo GPU:
+#   *-base-cuda12.8.1  → BẮT BUỘC cho RTX 5090 (Blackwell, sm_120).
+#                        CUDA 12.6 KHÔNG hỗ trợ sm_120, worker sẽ crash lúc
+#                        nạp model với lỗi "no kernel image is available".
+#   *-base             → CUDA 12.6, đủ cho L40S / A6000 / A100 / H100 (≤ Ada).
+#
+# Tag mới nhất: https://hub.docker.com/r/runpod/worker-comfyui/tags
+ARG WORKER_COMFYUI_TAG=5.8.5-base-cuda12.8.1
+FROM runpod/worker-comfyui:${WORKER_COMFYUI_TAG}
 
 # ---- Dependencies bổ sung -----------------------------------------------
 # boto3: upload lên Cloudflare R2 (S3-compatible)

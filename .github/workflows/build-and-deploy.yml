@@ -36,13 +36,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Base image worker-comfyui khá nặng (CUDA + torch + ComfyUI).
-      # Runner mặc định dễ hết đĩa giữa chừng — dọn trước cho chắc.
+      # Base image worker-comfyui NẶNG (~17GB với biến thể cuda12.8.1).
+      # Runner GitHub mặc định chỉ còn ~25GB trống → phải dọn trước, nếu không
+      # build sẽ chết giữa chừng với "no space left on device".
       - name: Giải phóng dung lượng đĩa
         run: |
           echo "Trước:"; df -h / | tail -1
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
-                      /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
+                      /usr/local/share/boost /opt/hostedtoolcache \
+                      /usr/local/share/powershell /usr/share/swift \
+                      "$AGENT_TOOLSDIRECTORY" || true
+          sudo apt-get clean || true
           sudo docker image prune -af || true
           echo "Sau:"; df -h / | tail -1
 
