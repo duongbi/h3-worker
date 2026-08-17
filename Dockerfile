@@ -18,11 +18,32 @@ FROM runpod/worker-comfyui:${WORKER_COMFYUI_TAG}
 # httpx : tải asset đầu vào từ presigned URL, có retry
 RUN pip install --no-cache-dir boto3==1.35.* httpx==0.27.*
 
+# ---- Cập nhật ComfyUI ----------------------------------------------------
+# BẮT BUỘC: base image được build từ trước, ComfyUI trong đó có thể CŨ HƠN bản
+# bạn dùng để dựng workflow trên Pod. Các node MiniMaxH3ImageToVideo,
+# ResolutionSelector, ComfyMathExpression, SaveVideo, CreateVideo là node core
+# nhưng chỉ có ở ComfyUI mới — thiếu là workflow fail với "node type not found".
+#
+# Đặt COMFYUI_VERSION = đúng tag/commit bạn đã test trên Pod (chạy
+# `cd /workspace/ComfyUI && git describe --tags` để lấy). Để "master" thì build
+# lấy bản mới nhất — tiện nhưng không tái lập được.
+# Nhận được: tag (v0.3.x), nhánh (master), hoặc SHA đầy đủ 40 ký tự.
+# SHA RÚT GỌN sẽ KHÔNG hoạt động với `git fetch` — phải dùng bản đầy đủ
+# (`git rev-parse HEAD` trên Pod).
+ARG COMFYUI_VERSION=master
+RUN cd /comfyui \
+ && git fetch origin --tags \
+ && ( git checkout "${COMFYUI_VERSION}" \
+      || ( git fetch --depth 1 origin "${COMFYUI_VERSION}" && git checkout FETCH_HEAD ) ) \
+ && git log -1 --format='ComfyUI @ %H (%ci)' \
+ && grep -viE '^(torch|torchvision|torchaudio)([=<>~!].*)?$' requirements.txt > /tmp/req.txt \
+ && pip install --no-cache-dir -r /tmp/req.txt \
+ && rm /tmp/req.txt
+
 # ---- Custom nodes --------------------------------------------------------
-# VideoHelperSuite: node VHS_VideoCombine để ghép frame + audio thành mp4.
-# LƯU Ý: danh sách này phải khớp với workflow bạn export ra từ ComfyUI.
-#        Chạy `comfy node show all` trong Pod tạm để lấy đúng tên package.
-RUN comfy-node-install comfyui-videohelpersuite
+# Workflow h3_fl2va_api.json hiện CHỈ dùng node core → không cần custom node nào.
+# Nếu sau này bạn thêm node vào workflow, khai báo ở đây:
+#   RUN comfy-node-install <tên-package>
 
 # ---- Trỏ ComfyUI sang network volume ------------------------------------
 # Weights KHÔNG nằm trong image (31.7 GB — image sẽ pull rất chậm).
