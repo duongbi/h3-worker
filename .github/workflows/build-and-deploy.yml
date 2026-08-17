@@ -4,13 +4,13 @@ name: Build & Deploy h3-worker
 # Nếu đã set secret RUNPOD_API_KEY + RUNPOD_TEMPLATE_ID, job deploy sẽ PATCH
 # template trên RunPod sang image mới → RunPod tự rolling release endpoint.
 
+# KHÔNG dùng bộ lọc `paths`. Nó im lặng bỏ qua push khi file thay đổi không
+# khớp danh sách, và cách nó tính diff sau một rebase/merge rất khó đoán —
+# ta đã mất một vòng debug vì tưởng CI hỏng trong khi nó chỉ đang bỏ qua.
+# Build thừa vài phút rẻ hơn nhiều so với việc deploy nhầm image cũ.
 on:
   push:
     branches: [main]
-    paths:
-      - 'Dockerfile'
-      - 'src/**'
-      - '.github/workflows/build-and-deploy.yml'
     tags: ['v*']
   workflow_dispatch:
     inputs:
