@@ -3,3 +3,5 @@ __pycache__/
 *.pyc
 workflows/*.json
 !workflows/*.example.json
+node_modules/
+package-lock.json
