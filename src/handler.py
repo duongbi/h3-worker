@@ -110,6 +110,9 @@ def get_s3():
             region_name="auto",                       # R2 luôn dùng "auto"
             config=Config(
                 signature_version="s3v4",
+                # path-style: https://<host>/<bucket>/<key>
+                # Không đặt thì boto3 có thể ghép <bucket>.<host> → DNS không phân giải.
+                s3={"addressing_style": "path"},
                 retries={"max_attempts": 3, "mode": "standard"},
             ),
         )
