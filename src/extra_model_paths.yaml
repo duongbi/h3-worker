@@ -1,0 +1,27 @@
+# ComfyUI đọc file này lúc khởi động và thêm các đường dẫn model bổ sung.
+# Network volume của RunPod luôn được mount tại /runpod-volume trên serverless
+# (trên Pod thường thì nó là /workspace — xem scripts/download_models.sh).
+#
+# Cấu trúc kỳ vọng trên volume:
+#   /runpod-volume/ComfyUI/models/diffusion_models/*.safetensors
+#   /runpod-volume/ComfyUI/models/text_encoders/*.safetensors
+#   /runpod-volume/ComfyUI/models/vae/*.safetensors
+#   /runpod-volume/ComfyUI/custom_nodes/...        (tuỳ chọn)
+
+runpod_volume:
+  base_path: /runpod-volume/ComfyUI/
+  diffusion_models: models/diffusion_models
+  text_encoders: models/text_encoders
+  clip: models/text_encoders
+  vae: models/vae
+  loras: models/loras
+  upscale_models: models/upscale_models
+  custom_nodes: custom_nodes
+
+# Fallback khi chạy local bằng docker-compose (bind mount ./models)
+local_dev:
+  base_path: /workspace/ComfyUI/
+  diffusion_models: models/diffusion_models
+  text_encoders: models/text_encoders
+  clip: models/text_encoders
+  vae: models/vae

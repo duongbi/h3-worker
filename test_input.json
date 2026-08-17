@@ -1,0 +1,13 @@
+{
+  "input": {
+    "workflow": {
+      "__REPLACE_ME__": "Dán nội dung workflows/h3_fl2va_api.json vào đây trước khi test",
+      "__note__": "File này chỉ dùng cho SERVE_API_LOCALLY=true. Xem workflows/README.md."
+    },
+    "assets": [],
+    "meta": {
+      "jobId": "local-test-0001"
+    },
+    "output_prefix": "smoke-test"
+  }
+}
