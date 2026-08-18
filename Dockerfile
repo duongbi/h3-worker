@@ -30,12 +30,30 @@ RUN pip install --no-cache-dir boto3==1.35.* httpx==0.27.*
 # Nhận được: tag (v0.3.x), nhánh (master), hoặc SHA đầy đủ 40 ký tự.
 # SHA RÚT GỌN sẽ KHÔNG hoạt động với `git fetch` — phải dùng bản đầy đủ
 # (`git rev-parse HEAD` trên Pod).
+#
+# ⚠ BẪY ĐÃ DÍNH (18/08/2026): trước đây chỗ này là `git checkout "${COMFYUI_VERSION}"`.
+#   Base image ĐÃ CÓ SẴN nhánh local `master` trỏ vào commit cũ, nên `git checkout master`
+#   chỉ chuyển sang nhánh local đó chứ KHÔNG lấy `origin/master` vừa fetch về.
+#   Build vẫn xanh, image vẫn giữ ComfyUI tháng 3/2026, và job chết ở runtime với
+#   "Node 'MiniMax H3 Image to Video' not found". Luôn ưu tiên `origin/<nhánh>`.
 ARG COMFYUI_VERSION=master
 RUN cd /comfyui \
- && git fetch origin --tags \
- && ( git checkout "${COMFYUI_VERSION}" \
-      || ( git fetch --depth 1 origin "${COMFYUI_VERSION}" && git checkout FETCH_HEAD ) ) \
+ && git config --global --add safe.directory /comfyui \
+ && if [ "$(git rev-parse --is-shallow-repository)" = "true" ]; then \
+        git fetch --unshallow origin || git fetch origin; \
+    fi \
+ && git fetch origin --tags --force --prune \
+ && TARGET="$( git rev-parse --verify --quiet "origin/${COMFYUI_VERSION}^{commit}" \
+            || git rev-parse --verify --quiet "refs/tags/${COMFYUI_VERSION}^{commit}" \
+            || git rev-parse --verify --quiet "${COMFYUI_VERSION}^{commit}" \
+            || { git fetch --depth 1 origin "${COMFYUI_VERSION}" >/dev/null 2>&1 \
+                 && git rev-parse FETCH_HEAD; } )" \
+ && if [ -z "$TARGET" ]; then \
+        echo "!! Không phân giải được COMFYUI_VERSION='${COMFYUI_VERSION}'"; exit 1; \
+    fi \
+ && git checkout --detach --force "$TARGET" \
  && git log -1 --format='ComfyUI @ %H (%ci)' \
+ && git describe --tags \
  && grep -viE '^(torch|torchvision|torchaudio)([=<>~!].*)?$' requirements.txt > /tmp/req.txt \
  && pip install --no-cache-dir -r /tmp/req.txt \
  && rm /tmp/req.txt
@@ -44,6 +62,15 @@ RUN cd /comfyui \
 # Workflow h3_fl2va_api.json hiện CHỈ dùng node core → không cần custom node nào.
 # Nếu sau này bạn thêm node vào workflow, khai báo ở đây:
 #   RUN comfy-node-install <tên-package>
+
+# ---- Kiểm tra node bắt buộc NGAY LÚC BUILD -------------------------------
+# Vì sao: lỗi "node type not found" trước đây chỉ lộ ra sau khi build 35 phút,
+# deploy, cold start rồi gửi job — mất cả tiếng cho một thứ kiểm tra được trong 1 giây.
+# Thiếu node là build FAIL, không bao giờ ra tới RunPod nữa.
+COPY scripts/check_workflow_nodes.py /tmp/check_workflow_nodes.py
+COPY workflows/h3_fl2va_api.json /tmp/wf.json
+RUN python /tmp/check_workflow_nodes.py /tmp/wf.json /comfyui \
+ && rm -f /tmp/check_workflow_nodes.py /tmp/wf.json
 
 # ---- Trỏ ComfyUI sang network volume ------------------------------------
 # Weights KHÔNG nằm trong image (31.7 GB — image sẽ pull rất chậm).
