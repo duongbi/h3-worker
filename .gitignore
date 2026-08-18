@@ -1,7 +1,15 @@
 .env
 __pycache__/
 *.pyc
+
+# Các bản export workflow linh tinh không cần lên repo...
 workflows/*.json
 !workflows/*.example.json
+# ...NHƯNG h3_fl2va_api.json thì BẮT BUỘC phải commit: Dockerfile COPY nó vào
+# image để chạy scripts/check_workflow_nodes.py lúc build. Thiếu là build chết với
+# "failed to compute cache key: /workflows/h3_fl2va_api.json: not found"
+# (đã dính ngày 18/08/2026). File này không chứa secret, chỉ là đồ thị node.
+!workflows/h3_fl2va_api.json
+
 node_modules/
 package-lock.json
