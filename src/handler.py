@@ -152,24 +152,80 @@ def upload_to_r2(path: Path, key: str) -> Dict[str, Any]:
 # --------------------------------------------------------------------------
 # ComfyUI
 # --------------------------------------------------------------------------
+def _comfy_pids() -> List[int]:
+    """PID của tiến trình ComfyUI (python .../main.py) đang chạy trong container."""
+    pids = []
+    for p in Path("/proc").iterdir():
+        if not p.name.isdigit():
+            continue
+        try:
+            cmdline = (p / "cmdline").read_bytes().decode("utf-8", "replace")
+        except OSError:
+            continue                                   # tiến trình vừa thoát
+        if "main.py" in cmdline and "python" in cmdline:
+            pids.append(int(p.name))
+    return pids
+
+
+def _volume_report() -> str:
+    """Mô tả ngắn tình trạng network volume — nguyên nhân hay gặp nhất."""
+    base = Path("/runpod-volume")
+    if not base.exists():
+        return "/runpod-volume KHÔNG tồn tại → network volume chưa gắn vào endpoint."
+    models = base / "ComfyUI" / "models" / "diffusion_models"
+    if not models.is_dir():
+        return f"{models} không tồn tại → volume gắn rồi nhưng sai cấu trúc thư mục."
+    return f"{models}: {len(list(models.glob('*.safetensors')))} file .safetensors."
+
+
 def wait_for_comfy(timeout_sec: int = 600) -> None:
     """
-    Chờ ComfyUI sẵn sàng. Trên cold start, ComfyUI phải nạp ~32GB weights
-    từ network volume nên chỗ này có thể mất vài phút — đừng đặt timeout thấp.
+    Chờ ComfyUI sẵn sàng.
+
+    ComfyUI mở cổng 8188 TRƯỚC khi nạp weights (weights nạp lazy lúc chạy prompt),
+    nên bình thường chỗ này chỉ mất vài chục giây. 'Connection refused' lặp lại
+    gần như luôn nghĩa là tiến trình ComfyUI đã chết, không phải đang chậm —
+    phát hiện sớm thay vì đợi hết timeout rồi báo một lỗi vô nghĩa.
     """
-    deadline = time.time() + timeout_sec
+    start = time.time()
+    deadline = start + timeout_sec
     last_err = None
+    next_beat = start + 15
+    saw_process = False
+
     with httpx.Client(timeout=5) as c:
         while time.time() < deadline:
             try:
                 r = c.get(f"{COMFY_URL}/system_stats")
                 if r.status_code == 200:
-                    log("ComfyUI sẵn sàng.")
+                    log(f"ComfyUI sẵn sàng sau {time.time() - start:.0f}s.")
                     return
+                last_err = f"HTTP {r.status_code}"
             except Exception as e:                    # noqa: BLE001
                 last_err = e
+
+            pids = _comfy_pids()
+            if pids:
+                saw_process = True
+            elif saw_process or time.time() - start > 20:
+                # Đã thấy tiến trình rồi mất → crash.
+                # Chưa từng thấy sau 20s → start.sh không chạy được ComfyUI.
+                raise RuntimeError(
+                    "Tiến trình ComfyUI không chạy trong container ("
+                    + ("đã crash sau khi khởi động" if saw_process else "chưa từng khởi động")
+                    + f"). Lỗi kết nối cuối: {last_err}. Volume: {_volume_report()} "
+                    "Traceback thật nằm ở tab Container trên RunPod console."
+                )
+
+            if time.time() >= next_beat:
+                log(f"Chờ ComfyUI… {time.time() - start:.0f}s, pid={pids or 'không có'}, lỗi={last_err}")
+                next_beat = time.time() + 15
             time.sleep(0.5)
-    raise RuntimeError(f"ComfyUI không phản hồi sau {timeout_sec}s (lỗi cuối: {last_err})")
+
+    raise RuntimeError(
+        f"ComfyUI không phản hồi sau {timeout_sec}s (lỗi cuối: {last_err}). "
+        f"pid ComfyUI: {_comfy_pids() or 'không có'}. Volume: {_volume_report()}"
+    )
 
 
 def stage_assets(assets: List[Dict[str, Any]], warnings: List[str]) -> None:

@@ -6,7 +6,16 @@
 #   /runpod-volume/ComfyUI/models/diffusion_models/*.safetensors
 #   /runpod-volume/ComfyUI/models/text_encoders/*.safetensors
 #   /runpod-volume/ComfyUI/models/vae/*.safetensors
-#   /runpod-volume/ComfyUI/custom_nodes/...        (tuỳ chọn)
+#
+# ⚠ TUYỆT ĐỐI KHÔNG thêm lại key `custom_nodes` vào đây trừ khi thư mục
+#   /runpod-volume/ComfyUI/custom_nodes CHẮC CHẮN đã tồn tại trên volume.
+#   ComfyUI gọi os.listdir() thẳng lên đường dẫn custom_nodes trong
+#   execute_prestartup_script() (main.py:145) mà KHÔNG bọc try/except.
+#   Thư mục thiếu → FileNotFoundError → ComfyUI chết trước khi mở cổng 8188,
+#   handler treo đủ 600s rồi báo "Connection refused". Đã dính ngày 18/08/2026.
+#   Các key model khác (loras, upscale_models...) thiếu thì ComfyUI bỏ qua êm,
+#   riêng custom_nodes là fatal.
+#   Workflow h3_fl2va_api.json chỉ dùng node core nên không cần key này.
 
 runpod_volume:
   base_path: /runpod-volume/ComfyUI/
@@ -16,7 +25,6 @@ runpod_volume:
   vae: models/vae
   loras: models/loras
   upscale_models: models/upscale_models
-  custom_nodes: custom_nodes
 
 # Fallback khi chạy local bằng docker-compose (bind mount ./models)
 local_dev:
