@@ -39,6 +39,7 @@ import json
 import logging
 import mimetypes
 import os
+import re
 import time
 import uuid
 from pathlib import Path
@@ -178,6 +179,44 @@ def _volume_report() -> str:
     return f"{models}: {len(list(models.glob('*.safetensors')))} file .safetensors."
 
 
+# CUDA 13.0 GA đòi driver Linux >= 580.65.06 (NVIDIA CUDA Toolkit release notes).
+_CUDA13_MIN_DRIVER = (580, 65)
+
+
+def _driver_version() -> Optional[Tuple[int, ...]]:
+    """Phiên bản driver NVIDIA của host, đọc từ /proc — không cần import torch."""
+    try:
+        txt = Path("/proc/driver/nvidia/version").read_text()
+    except OSError:
+        return None
+    m = re.search(r"Kernel Module\s+([0-9]+(?:\.[0-9]+)+)", txt)
+    if not m:
+        return None
+    return tuple(int(x) for x in m.group(1).split("."))
+
+
+def _gpu_report(stats: Dict[str, Any]) -> str:
+    """
+    Một dòng: bản torch (kèm +cu1xx) và driver NVIDIA của host.
+
+    Vì sao đáng in mỗi job: image build cho cu130 mà host còn driver r57x thì
+    ComfyUI vẫn khởi động bình thường, chỉ chết lúc chạm GPU với
+    'CUDA driver version is insufficient for CUDA runtime version' — rất khó lần
+    nếu không biết trước. Worker RunPod rơi vào host nào là chuyện hên xui, nên
+    con số này phải có trong log của TỪNG job, không phải chỉ lúc build.
+    """
+    torch_ver = str((stats.get("system") or {}).get("pytorch_version", "?"))
+    drv = _driver_version()
+    line = f"torch={torch_ver} · driver={'.'.join(map(str, drv)) if drv else 'không đọc được'}"
+    if "+cu13" in torch_ver and drv and drv[:2] < _CUDA13_MIN_DRIVER:
+        line += (
+            f" · ⚠ torch build cho CUDA 13 nhưng driver < "
+            f"{_CUDA13_MIN_DRIVER[0]}.{_CUDA13_MIN_DRIVER[1]} → job sẽ chết khi chạm GPU. "
+            "Build lại với --build-arg TORCH_CHANNEL=cu128, hoặc trỏ Template về image tag SHA cũ."
+        )
+    return line
+
+
 def wait_for_comfy(timeout_sec: int = 600) -> None:
     """
     Chờ ComfyUI sẵn sàng.
@@ -199,6 +238,10 @@ def wait_for_comfy(timeout_sec: int = 600) -> None:
                 r = c.get(f"{COMFY_URL}/system_stats")
                 if r.status_code == 200:
                     log(f"ComfyUI sẵn sàng sau {time.time() - start:.0f}s.")
+                    try:
+                        log(_gpu_report(r.json()))
+                    except Exception as e:            # noqa: BLE001 — chỉ là log
+                        log(f"Không đọc được /system_stats: {e}")
                     return
                 last_err = f"HTTP {r.status_code}"
             except Exception as e:                    # noqa: BLE001

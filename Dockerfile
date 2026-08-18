@@ -58,6 +58,46 @@ RUN cd /comfyui \
  && pip install --no-cache-dir -r /tmp/req.txt \
  && rm /tmp/req.txt
 
+# ---- PyTorch cu130 -------------------------------------------------------
+# VÌ SAO: base image đi kèm torch 2.10.0+cu128, và với cu128 thì comfy_kitchen
+# TẮT backend `cuda` lẫn `triton`, chỉ còn `eager`. Log worker in rất rõ:
+#     WARNING: You need pytorch with cu130 or higher to use optimized CUDA operations
+#     Found comfy_kitchen backend cuda:   {'available': True, 'disabled': True, ...}
+#     Found comfy_kitchen backend triton: {'available': True, 'disabled': True, ...}
+# Text encoder của H3 là nvfp4 (qwen3vl_32b_..._nvfp4_awq) nên mỗi lần forward
+# phải gọi `dequantize_nvfp4` hàng trăm lần bằng đường eager chậm nhất.
+# Đo được 18/08/2026: video 4s / 10 steps mất 227s execute — quá chậm.
+# Nâng cu130 bật lại kernel tối ưu, và mở đường dùng diffusion bản
+# `pruned_int8_convrot` sau này (bản đó cũng đòi cu130).
+#
+# ⚠ RÀNG BUỘC DRIVER — đọc trước khi build:
+#   CUDA 13.0 cần driver Linux >= 580.65.06. Host RunPod còn r570/r575 thì torch
+#   sẽ chết ngay khi chạm GPU với "CUDA driver version is insufficient for CUDA
+#   runtime version". handler.py in driver + bản torch ra đầu mỗi job
+#   (xem `_gpu_report`) nên nhìn log là biết ngay, không phải đoán.
+#   Quay lui: build lại với `--build-arg TORCH_CHANNEL=cu128`, hoặc nhanh hơn là
+#   trỏ Template về image tag SHA cũ (mọi tag SHA vẫn còn trên ghcr).
+#
+# Đặt SAU bước cài requirements của ComfyUI để pip không kéo ngược torch về cu128.
+# 3 gói phải khớp bộ: torch 2.10.0 ↔ torchvision 0.25.0 ↔ torchaudio 2.10.0.
+# torchaudio là bắt buộc, không bỏ được: H3 sinh cả audio, ComfyUI nạp
+# comfy_extras/nodes_audio.py lúc khởi động.
+ARG TORCH_CHANNEL=cu130
+ARG TORCH_VERSION=2.10.0
+ARG TORCHVISION_VERSION=0.25.0
+ARG TORCHAUDIO_VERSION=2.10.0
+RUN set -eux; \
+    if [ "${TORCH_CHANNEL}" = "cu128" ]; then \
+        echo ">> TORCH_CHANNEL=cu128 → giữ nguyên torch của base image"; \
+    else \
+        pip install --no-cache-dir --upgrade \
+            --index-url "https://download.pytorch.org/whl/${TORCH_CHANNEL}" \
+            "torch==${TORCH_VERSION}" \
+            "torchvision==${TORCHVISION_VERSION}" \
+            "torchaudio==${TORCHAUDIO_VERSION}"; \
+        python -c "import torch,sys; v=torch.version.cuda or ''; print('>> torch', torch.__version__, '| cuda', v); sys.exit(0 if v.split('.')[0]=='13' else 1)"; \
+    fi
+
 # ---- Custom nodes --------------------------------------------------------
 # Workflow h3_fl2va_api.json hiện CHỈ dùng node core → không cần custom node nào.
 # Nếu sau này bạn thêm node vào workflow, khai báo ở đây:

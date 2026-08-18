@@ -14,6 +14,16 @@
  *   SEED=123456        để trống thì random
  *   JOB_ID=<id>        BỎ QUA submit, poll tiếp một job đã gửi trước đó
  *
+ * Thí nghiệm tăng tốc (chèn node vào payload, KHÔNG sửa file workflow):
+ *   EASYCACHE=0.2      bật node EasyCache, số là reuse_threshold (0 = tắt).
+ *                      Càng cao càng nhanh, càng dễ mất chi tiết. 0.15–0.3 là vùng hay dùng.
+ *   EASYCACHE_START=0.15 / EASYCACHE_END=0.95   khoảng % số bước được phép tái dùng
+ *   COMPILE=1          bật node TorchCompileModel (backend inductor)
+ *
+ *   Đo một biến một lúc. Chạy chồng EASYCACHE với COMPILE ngay lần đầu thì
+ *   không biết cái nào ăn, mà torch.compile còn hay phải compile lại khi
+ *   EasyCache đổi đường chạy.
+ *
  * ⚠ Cú pháp đặt biến khác nhau theo shell:
  *   Git Bash / WSL :  DURATION=4 STEPS=10 node --env-file=.env scripts/test-endpoint.mjs "..."
  *   PowerShell     :  $env:DURATION=4; $env:STEPS=10; node --env-file=.env scripts/test-endpoint.mjs "..."
@@ -39,8 +49,13 @@ const NODE = {
   DURATION: "105:111", // PrimitiveFloat       .value  (giây)
   RESOLUTION: "115",   // ResolutionSelector   .aspect_ratio / .megapixels
   SCHEDULER: "105:9",  // BasicScheduler       .steps
+  GUIDER: "105:16",    // BasicGuider          .model  ← chỗ cắm node tăng tốc
   SAVE: "92",          // SaveVideo            .filename_prefix
 };
+
+// ID cho node chèn thêm lúc chạy. Không được trùng ID có sẵn trong workflow.
+const ACCEL_COMPILE = "acc:compile";
+const ACCEL_EASYCACHE = "acc:easycache";
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -99,11 +114,48 @@ if (id) {
   if (process.env.ASPECT) wf[NODE.RESOLUTION].inputs.aspect_ratio = process.env.ASPECT;
   if (process.env.STEPS) wf[NODE.SCHEDULER].inputs.steps = Number(process.env.STEPS);
 
+  // ---- Node tăng tốc, chèn lúc gửi ---------------------------------------
+  // Chèn ở đây thay vì sửa h3_fl2va_api.json để mỗi lần đo chỉ khác nhau một
+  // biến, và không phải commit/revert JSON sau mỗi thí nghiệm.
+  //
+  // Chỉ nối vào BasicGuider. BasicScheduler cũng nhận `model` nhưng chỉ dùng để
+  // tính sigmas, không chạy forward — nối vào đó không nhanh thêm được gì.
+  const accel = [];
+  let modelRef = wf[NODE.GUIDER].inputs.model;        // mặc định ["105:6", 0]
+
+  if (process.env.COMPILE === "1") {
+    wf[ACCEL_COMPILE] = {
+      class_type: "TorchCompileModel",
+      inputs: { model: modelRef, backend: "inductor" },
+    };
+    modelRef = [ACCEL_COMPILE, 0];
+    accel.push("torch.compile");
+  }
+
+  const easycache = Number(process.env.EASYCACHE ?? 0);
+  if (easycache > 0) {
+    wf[ACCEL_EASYCACHE] = {
+      class_type: "EasyCache",
+      inputs: {
+        model: modelRef,
+        reuse_threshold: easycache,
+        start_percent: Number(process.env.EASYCACHE_START ?? 0.15),
+        end_percent: Number(process.env.EASYCACHE_END ?? 0.95),
+        verbose: true,                 // log ComfyUI sẽ nói đã tái dùng mấy bước
+      },
+    };
+    modelRef = [ACCEL_EASYCACHE, 0];
+    accel.push(`EasyCache ${easycache}`);
+  }
+
+  wf[NODE.GUIDER].inputs.model = modelRef;
+
   const jobId = `test-${Date.now()}`;
   console.log(`→ endpoint  ${ENDPOINT}`);
   console.log(`→ prompt    ${prompt.slice(0, 70)}…`);
   console.log(`→ ${wf[NODE.DURATION].inputs.value}s · ${wf[NODE.RESOLUTION].inputs.megapixels}MP · ` +
-              `${wf[NODE.SCHEDULER].inputs.steps} steps · seed ${seed}\n`);
+              `${wf[NODE.SCHEDULER].inputs.steps} steps · seed ${seed}`);
+  console.log(`→ tăng tốc  ${accel.length ? accel.join(" + ") : "không (bản gốc)"}\n`);
 
   const submit = await fetchRetry(`${BASE}/run`, {
     method: "POST",
