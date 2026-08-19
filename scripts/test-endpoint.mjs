@@ -9,28 +9,31 @@
  * Tuỳ chọn qua biến môi trường:
  *   DURATION=10        số giây (4–15)
  *   ASPECT="9:16 (Portrait Widescreen)"
- *   MEGAPIXELS=1       1.0 ≈ 768p
- *   STEPS=20           giảm còn 10 để nhanh gấp đôi
- *   SEED=123456        để trống thì random
+ *   MEGAPIXELS=1       1.0 ≈ 768p · 0.7 ≈ 640p · 0.5 ≈ 540p
+ *   STEPS=20           giảm còn 12–14 để nhanh gần gấp đôi
+ *   SEED=123456        để trống thì random — ĐẶT CỐ ĐỊNH khi so sánh cấu hình
  *   JOB_ID=<id>        BỎ QUA submit, poll tiếp một job đã gửi trước đó
  *
+ * Image to Video (ảnh phải ở URL công khai, worker tự tải về):
+ *   IMAGE=https://...        khung hình ĐẦU
+ *   IMAGE_LAST=https://...   khung hình CUỐI (tuỳ chọn, dùng kèm hoặc riêng)
+ *   Không đặt gì → chạy T2V thuần như cũ.
+ *
  * Thí nghiệm tăng tốc (chèn node vào payload, KHÔNG sửa file workflow):
- *   EASYCACHE=0.2      bật node EasyCache, số là reuse_threshold (0 = tắt).
- *                      Càng cao càng nhanh, càng dễ mất chi tiết. 0.15–0.3 là vùng hay dùng.
+ *   EASYCACHE=0.2      reuse_threshold. Càng cao càng nhanh, càng dễ mất chi tiết.
  *   EASYCACHE_START=0.15 / EASYCACHE_END=0.95   khoảng % số bước được phép tái dùng
  *   COMPILE=1          bật node TorchCompileModel (backend inductor)
  *
- *   Đo một biến một lúc. Chạy chồng EASYCACHE với COMPILE ngay lần đầu thì
- *   không biết cái nào ăn, mà torch.compile còn hay phải compile lại khi
- *   EasyCache đổi đường chạy.
+ *   Muốn quét nhiều cấu hình một lượt thì dùng scripts/bench.mjs.
  *
  * ⚠ Cú pháp đặt biến khác nhau theo shell:
  *   Git Bash / WSL :  DURATION=4 STEPS=10 node --env-file=.env scripts/test-endpoint.mjs "..."
  *   PowerShell     :  $env:DURATION=4; $env:STEPS=10; node --env-file=.env scripts/test-endpoint.mjs "..."
  *   Đặt nhầm cú pháp thì script chạy với giá trị mặc định mà KHÔNG báo gì —
- *   luôn đọc dòng "→ Ns · NMP · N steps" in ra để xác nhận.
+ *   luôn đọc dòng "→ cấu hình" in ra để xác nhận.
  */
 import { readFile } from "node:fs/promises";
+import { buildWorkflow, cfgFromEnv } from "./build-workflow.mjs";
 
 const API_KEY = process.env.RUNPOD_API_KEY;
 const ENDPOINT = process.env.RUNPOD_ENDPOINT_ID;
@@ -40,22 +43,6 @@ if (!API_KEY || !ENDPOINT) {
 }
 const BASE = `https://api.runpod.ai/v2/${ENDPOINT}`;
 const H = { Authorization: `Bearer ${API_KEY}`, "Content-Type": "application/json" };
-
-// ---- Bản đồ node của h3_fl2va_api.json ----------------------------------
-// ID có dấu hai chấm vì workflow dùng subgraph — giữ nguyên dạng chuỗi.
-const NODE = {
-  PROMPT: "105:104",   // MiniMaxH3ImageToVideo .prompt
-  SEED: "105:15",      // RandomNoise         .noise_seed
-  DURATION: "105:111", // PrimitiveFloat       .value  (giây)
-  RESOLUTION: "115",   // ResolutionSelector   .aspect_ratio / .megapixels
-  SCHEDULER: "105:9",  // BasicScheduler       .steps
-  GUIDER: "105:16",    // BasicGuider          .model  ← chỗ cắm node tăng tốc
-  SAVE: "92",          // SaveVideo            .filename_prefix
-};
-
-// ID cho node chèn thêm lúc chạy. Không được trùng ID có sẵn trong workflow.
-const ACCEL_COMPILE = "acc:compile";
-const ACCEL_EASYCACHE = "acc:easycache";
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -95,73 +82,29 @@ if (id) {
     "A calm seaside at golden hour, gentle waves, a lone sailboat drifting. " +
     "Audio: soft waves, distant seagulls, warm ambient pad.";
 
-  const wf = JSON.parse(await readFile(new URL("../workflows/h3_fl2va_api.json", import.meta.url), "utf8"));
+  const base = JSON.parse(await readFile(new URL("../workflows/h3_fl2va_api.json", import.meta.url), "utf8"));
 
-  // Kiểm tra bản đồ node còn khớp — workflow export lại là ID đổi hết.
-  for (const [name, nid] of Object.entries(NODE)) {
-    if (!wf[nid]) {
-      console.error(`✗ Không tìm thấy node ${nid} (${name}) trong workflow.`);
-      console.error("  Bạn vừa export lại workflow? Chạy: python scripts/inspect_workflow.py workflows/h3_fl2va_api.json");
-      process.exit(1);
-    }
+  let built;
+  try {
+    built = buildWorkflow(base, { ...cfgFromEnv(), prompt });
+  } catch (e) {
+    console.error(`✗ ${e.message}`);
+    process.exit(1);
   }
-
-  const seed = Number(process.env.SEED) || Math.floor(Math.random() * 2 ** 48);
-  wf[NODE.PROMPT].inputs.prompt = prompt;
-  wf[NODE.SEED].inputs.noise_seed = seed;
-  wf[NODE.DURATION].inputs.value = Number(process.env.DURATION ?? 10);
-  wf[NODE.RESOLUTION].inputs.megapixels = Number(process.env.MEGAPIXELS ?? 1);
-  if (process.env.ASPECT) wf[NODE.RESOLUTION].inputs.aspect_ratio = process.env.ASPECT;
-  if (process.env.STEPS) wf[NODE.SCHEDULER].inputs.steps = Number(process.env.STEPS);
-
-  // ---- Node tăng tốc, chèn lúc gửi ---------------------------------------
-  // Chèn ở đây thay vì sửa h3_fl2va_api.json để mỗi lần đo chỉ khác nhau một
-  // biến, và không phải commit/revert JSON sau mỗi thí nghiệm.
-  //
-  // Chỉ nối vào BasicGuider. BasicScheduler cũng nhận `model` nhưng chỉ dùng để
-  // tính sigmas, không chạy forward — nối vào đó không nhanh thêm được gì.
-  const accel = [];
-  let modelRef = wf[NODE.GUIDER].inputs.model;        // mặc định ["105:6", 0]
-
-  if (process.env.COMPILE === "1") {
-    wf[ACCEL_COMPILE] = {
-      class_type: "TorchCompileModel",
-      inputs: { model: modelRef, backend: "inductor" },
-    };
-    modelRef = [ACCEL_COMPILE, 0];
-    accel.push("torch.compile");
-  }
-
-  const easycache = Number(process.env.EASYCACHE ?? 0);
-  if (easycache > 0) {
-    wf[ACCEL_EASYCACHE] = {
-      class_type: "EasyCache",
-      inputs: {
-        model: modelRef,
-        reuse_threshold: easycache,
-        start_percent: Number(process.env.EASYCACHE_START ?? 0.15),
-        end_percent: Number(process.env.EASYCACHE_END ?? 0.95),
-        verbose: true,                 // log ComfyUI sẽ nói đã tái dùng mấy bước
-      },
-    };
-    modelRef = [ACCEL_EASYCACHE, 0];
-    accel.push(`EasyCache ${easycache}`);
-  }
-
-  wf[NODE.GUIDER].inputs.model = modelRef;
+  const { wf, assets, label, seed } = built;
 
   const jobId = `test-${Date.now()}`;
   console.log(`→ endpoint  ${ENDPOINT}`);
   console.log(`→ prompt    ${prompt.slice(0, 70)}…`);
-  console.log(`→ ${wf[NODE.DURATION].inputs.value}s · ${wf[NODE.RESOLUTION].inputs.megapixels}MP · ` +
-              `${wf[NODE.SCHEDULER].inputs.steps} steps · seed ${seed}`);
-  console.log(`→ tăng tốc  ${accel.length ? accel.join(" + ") : "không (bản gốc)"}\n`);
+  console.log(`→ cấu hình  ${label} · seed ${seed}`);
+  if (assets.length) console.log(`→ ảnh vào   ${assets.map((a) => a.name).join(", ")}`);
+  console.log();
 
   const submit = await fetchRetry(`${BASE}/run`, {
     method: "POST",
     headers: H,
     body: JSON.stringify({
-      input: { workflow: wf, meta: { jobId }, output_prefix: "videos/test" },
+      input: { workflow: wf, assets, meta: { jobId }, output_prefix: "videos/test" },
       policy: { executionTimeout: 1_500_000, ttl: 3_600_000 },
     }),
   }, { label: "submit" });
@@ -172,7 +115,7 @@ if (id) {
   }
   ({ id } = await submit.json());
   console.log(`✓ đã submit, RunPod job id = ${id}`);
-  console.log("  Lần đầu sẽ RẤT lâu (pull image 17GB + nạp 35GB weights + sampling).");
+  console.log("  Worker lạnh sẽ rất lâu (pull image + nạp 38GB weights + sampling).");
   console.log(`  Mất kết nối cũng không sao — poll lại bằng:  JOB_ID=${id} node --env-file=.env scripts/test-endpoint.mjs\n`);
 }
 

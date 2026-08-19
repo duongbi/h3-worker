@@ -40,6 +40,7 @@ import logging
 import mimetypes
 import os
 import re
+import subprocess
 import time
 import uuid
 from pathlib import Path
@@ -184,30 +185,59 @@ _CUDA13_MIN_DRIVER = (580, 65)
 
 
 def _driver_version() -> Optional[Tuple[int, ...]]:
-    """Phiên bản driver NVIDIA của host, đọc từ /proc — không cần import torch."""
+    """
+    Phiên bản driver NVIDIA của host.
+
+    /proc/driver/nvidia/version thường KHÔNG được mount vào container của RunPod
+    (đã gặp 19/08/2026: in ra 'không đọc được'), nên phải có đường thứ hai là
+    nvidia-smi. Cả hai đều không cần import torch vào tiến trình handler.
+    """
     try:
         txt = Path("/proc/driver/nvidia/version").read_text()
+        m = re.search(r"Kernel Module\s+([0-9]+(?:\.[0-9]+)+)", txt)
+        if m:
+            return tuple(int(x) for x in m.group(1).split("."))
     except OSError:
-        return None
-    m = re.search(r"Kernel Module\s+([0-9]+(?:\.[0-9]+)+)", txt)
-    if not m:
-        return None
-    return tuple(int(x) for x in m.group(1).split("."))
+        pass
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=10,
+        ).stdout.strip().splitlines()
+        if out:
+            return tuple(int(x) for x in out[0].strip().split("."))
+    except (OSError, ValueError, subprocess.SubprocessError):
+        pass
+    return None
 
 
 def _gpu_report(stats: Dict[str, Any]) -> str:
     """
-    Một dòng: bản torch (kèm +cu1xx) và driver NVIDIA của host.
+    Một dòng: GPU nào, bao nhiêu VRAM, bản torch, driver NVIDIA.
 
-    Vì sao đáng in mỗi job: image build cho cu130 mà host còn driver r57x thì
-    ComfyUI vẫn khởi động bình thường, chỉ chết lúc chạm GPU với
-    'CUDA driver version is insufficient for CUDA runtime version' — rất khó lần
-    nếu không biết trước. Worker RunPod rơi vào host nào là chuyện hên xui, nên
-    con số này phải có trong log của TỪNG job, không phải chỉ lúc build.
+    Vì sao TỪNG job phải có dòng này:
+      1. RunPod đổi loại GPU giữa các job mà không báo. Ngày 18-19/08/2026 đã có
+         hai lần đo cùng cấu hình lệch nhau 40% và không quy được nguyên nhân,
+         vì log không nói job đó chạy trên card nào.
+      2. Image build cho cu130 mà host còn driver r57x thì ComfyUI vẫn khởi động
+         bình thường, chỉ chết lúc chạm GPU với 'CUDA driver version is
+         insufficient' — rất khó lần nếu không biết trước.
+    Lấy từ /system_stats của ComfyUI nên không tốn thêm gì, và nằm ở log của
+    handler (mức INFO) nên vẫn còn khi đặt COMFY_LOG_LEVEL=INFO.
     """
     torch_ver = str((stats.get("system") or {}).get("pytorch_version", "?"))
     drv = _driver_version()
-    line = f"torch={torch_ver} · driver={'.'.join(map(str, drv)) if drv else 'không đọc được'}"
+
+    gpus = []
+    for d in stats.get("devices") or []:
+        vram_gb = (d.get("vram_total") or 0) / (1024 ** 3)
+        gpus.append(f"{d.get('name', '?')} {vram_gb:.0f}GB")
+    gpu_txt = ", ".join(gpus) or "không rõ"
+
+    line = (
+        f"GPU={gpu_txt} · torch={torch_ver} · "
+        f"driver={'.'.join(map(str, drv)) if drv else 'không đọc được'}"
+    )
     if "+cu13" in torch_ver and drv and drv[:2] < _CUDA13_MIN_DRIVER:
         line += (
             f" · ⚠ torch build cho CUDA 13 nhưng driver < "
