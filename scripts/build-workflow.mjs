@@ -18,6 +18,7 @@ export const NODE = {
   RESOLUTION: "115",   // ResolutionSelector    .aspect_ratio / .megapixels
   SCHEDULER: "105:9",  // BasicScheduler        .steps
   GUIDER: "105:16",    // BasicGuider           .model  ← chỗ cắm node tăng tốc
+  UNET: "105:6",       // UNETLoader            .unet_name ← đổi bản lượng tử hoá
   SAVE: "92",          // SaveVideo             .filename_prefix
 };
 
@@ -72,6 +73,14 @@ export function buildWorkflow(baseWf, cfg = {}) {
   const seed = cfg.seed ?? Math.floor(Math.random() * 2 ** 48);
   const duration = Number(cfg.duration ?? 10);
   const megapixels = Number(cfg.megapixels ?? 1);
+
+  // ---- Bản lượng tử hoá của diffusion model ------------------------------
+  // Đo được 22/08/2026: trên RTX 5090, `pruned_fp8_scaled` chạy 44.5 s/bước vì
+  // 19983MB diffusion + 14956MB text encoder không vừa 31GB VRAM — aimdo phải
+  // stream liên tục. Đổi sang `pruned_nvfp4` (12.5GB) là đòn bẩy lớn nhất, và
+  // nó chỉ là đổi MỘT CHUỖI ở đây, không phải build lại image.
+  // File phải có sẵn trên volume — `test-pod.mjs` liệt kê được.
+  if (cfg.unet) wf[NODE.UNET].inputs.unet_name = cfg.unet;
 
   if (cfg.prompt) wf[NODE.PROMPT].inputs.prompt = cfg.prompt;
   wf[NODE.SEED].inputs.noise_seed = seed;
@@ -162,8 +171,13 @@ export function buildWorkflow(baseWf, cfg = {}) {
 
   wf[NODE.GUIDER].inputs.model = modelRef;
 
+  // Tên unet LUÔN nằm trong label. Bài học 19/08: hai lần đo lệch 40% mà không
+  // quy được nguyên nhân vì label không nói chạy weights nào trên card nào.
+  const unetShort = String(wf[NODE.UNET].inputs.unet_name || "")
+    .replace(/^minimax_h3_fl2va_/, "").replace(/\.safetensors$/, "");
+
   const label =
-    `${duration}s · ${megapixels}MP · ${wf[NODE.SCHEDULER].inputs.steps} steps` +
+    `${duration}s · ${megapixels}MP · ${wf[NODE.SCHEDULER].inputs.steps} steps · ${unetShort}` +
     (modes.length ? ` · I2V(${modes.join("+")})` : " · T2V") +
     (accel.length ? ` · ${accel.join(" + ")}` : "");
 
@@ -179,6 +193,7 @@ export function cfgFromEnv(env = process.env) {
     aspect: env.ASPECT,
     steps: env.STEPS,
     // LORA="minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors" STEPS=8 EASYCACHE=0
+    unet: env.UNET,
     lora: env.LORA,
     loraStrength: env.LORA_STRENGTH,
     easycache: env.EASYCACHE ?? 0,

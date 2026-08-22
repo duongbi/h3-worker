@@ -74,6 +74,36 @@ case "$TORCH_CUDA" in
     ;;
 esac
 
+# ---- ComfyUI-Manager: tắt tải registry lúc khởi động ----------------------
+# Triệu chứng: hàng trăm dòng "FETCH ComfyRegistry Data: n/176" mỗi lần boot,
+# kéo dài hàng chục giây GPU trả tiền, và treo hẳn nếu api.comfy.org chậm.
+#
+# `/start.sh` của base image CÓ đặt offline, nhưng ghi vào đường dẫn CŨ
+# `user/default/ComfyUI-Manager/config.ini`. ComfyUI 0.33.0 của ta lại đọc
+# `user/__manager/config.ini` (System User API, từ 0.3.76+) — chính ComfyUI in
+# đường dẫn đó ra lúc khởi động. Nên offline chưa bao giờ ăn, kể cả trên
+# Serverless. Ghi vào CẢ HAI cho chắc, bất kể phiên bản.
+#
+# network_mode chỉ đọc được từ config.ini — không có env var, không có cờ CLI.
+# Workflow của ta chỉ dùng node core nên không cần Manager online bao giờ.
+# Cần cài node qua Manager thì đặt COMFY_MANAGER_NETWORK_MODE=public.
+MANAGER_MODE="${COMFY_MANAGER_NETWORK_MODE:-offline}"
+python - "$MANAGER_MODE" <<'PY' || log "⚠ không đặt được network_mode cho ComfyUI-Manager (bỏ qua)"
+import configparser, os, sys
+mode = sys.argv[1]
+for path in ("/comfyui/user/__manager/config.ini",
+             "/comfyui/user/default/ComfyUI-Manager/config.ini"):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    cp = configparser.ConfigParser()
+    cp.read(path)                       # file chưa có thì đọc rỗng, không lỗi
+    if not cp.has_section("default"):
+        cp.add_section("default")
+    cp.set("default", "network_mode", mode)
+    with open(path, "w") as f:
+        cp.write(f)
+    print(f"[pod-start] ComfyUI-Manager network_mode={mode} → {path}", flush=True)
+PY
+
 # ---- ComfyUI --------------------------------------------------------------
 # --highvram: Pod sống lâu, giữ weights thường trú là mục đích chính của việc
 #   đổi sang Pod. Card 32GB không đủ chỗ thì BỎ cờ này (aimdo tự xoay), card

@@ -56,6 +56,14 @@ export const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
  * luôn — khác với Serverless, nơi mọi lỗi HTTP đều để caller tự quyết.
  */
 export async function fetchRetry(url, opts = {}, { tries = 5, label = "request" } = {}) {
+  // Retry một POST đã tới nơi = tạo job trùng. Ngày 22/08/2026 một lượt bench 4
+  // cấu hình đẻ ra 6 job vì chỗ này retry `POST /run`. Chỉ cho retry POST khi
+  // request mang Idempotency-Key — lúc đó Pod trả lại đúng job cũ.
+  const isPost = String(opts.method || "GET").toUpperCase() === "POST";
+  const hasIdem = Boolean(opts.headers?.["Idempotency-Key"]);
+  const safeToRetry = !isPost || hasIdem;
+  if (!safeToRetry) tries = 1;
+
   let lastErr;
   for (let i = 1; i <= tries; i++) {
     try {
@@ -78,6 +86,34 @@ export async function fetchRetry(url, opts = {}, { tries = 5, label = "request" 
     }
   }
   throw lastErr;
+}
+
+/**
+ * Gửi một job. Nơi DUY NHẤT được phép gọi `POST /run`.
+ *
+ * Sinh một Idempotency-Key cho mỗi lần gọi, nên retry (proxy RunPod hay trả
+ * 502/503 lúc Pod bận) trả lại ĐÚNG job cũ thay vì đẻ job mới. Không có nó thì
+ * một lượt bench 4 cấu hình có thể ra 6 job — đã xảy ra thật 22/08/2026, và hai
+ * job thừa hỏng với thông báo chỉ sai đường ("SaveVideo bị mute").
+ *
+ * Serverless bỏ qua header lạ nên vẫn chạy bình thường; ở đó RunPod tự chống
+ * trùng theo cách riêng của họ.
+ *
+ * @returns {Promise<{id: string, status: string}>}
+ */
+export async function submitJob(body, { label = "submit" } = {}) {
+  const res = await fetchRetry(BASE + "/run", {
+    method: "POST",
+    headers: { ...HEADERS, "Idempotency-Key": crypto.randomUUID() },
+    body: JSON.stringify(body),
+  }, { label });
+
+  if (!res.ok) {
+    throw new Error(`/run → HTTP ${res.status}: ${(await res.text()).slice(0, 500)}`);
+  }
+  const data = await res.json();
+  if (!data.id) throw new Error(`/run không trả về job id: ${JSON.stringify(data).slice(0, 300)}`);
+  return data;
 }
 
 /**

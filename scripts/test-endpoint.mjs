@@ -41,7 +41,7 @@
  */
 import { readFile } from "node:fs/promises";
 import { buildWorkflow, cfgFromEnv } from "./build-workflow.mjs";
-import { BASE, HEADERS as H, TARGET, IS_POD, requireConfig, fetchRetry, sleep } from "./endpoint.mjs";
+import { BASE, HEADERS as H, TARGET, IS_POD, requireConfig, fetchRetry, sleep, submitJob } from "./endpoint.mjs";
 
 requireConfig();
 
@@ -74,20 +74,15 @@ if (id) {
   if (assets.length) console.log(`→ ảnh vào   ${assets.map((a) => a.name).join(", ")}`);
   console.log();
 
-  const submit = await fetchRetry(`${BASE}/run`, {
-    method: "POST",
-    headers: H,
-    body: JSON.stringify({
+  try {
+    ({ id } = await submitJob({
       input: { workflow: wf, assets, meta: { jobId }, output_prefix: "videos/test" },
       policy: { executionTimeout: 1_500_000, ttl: 3_600_000 },
-    }),
-  }, { label: "submit" });
-
-  if (!submit.ok) {
-    console.error(`✗ /run → ${submit.status}: ${await submit.text()}`);
+    }));
+  } catch (e) {
+    console.error(`✗ ${e.message}`);
     process.exit(1);
   }
-  ({ id } = await submit.json());
   console.log(`✓ đã submit, RunPod job id = ${id}`);
   console.log(
     IS_POD

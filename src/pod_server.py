@@ -89,6 +89,17 @@ _jobs: Dict[str, Dict[str, Any]] = {}
 _jobs_lock = threading.Lock()
 _work: "queue.Queue[str]" = queue.Queue()
 
+# Idempotency-Key → job_id.
+#
+# VÌ SAO CẦN: `POST /run` không idempotent, mà client thì CÓ retry (proxy của
+# RunPod trả 502/503 lúc Pod bận hoặc mạng chớp). Retry một POST đã tới nơi =
+# job trùng. Ngày 22/08/2026 một lượt bench 4 cấu hình đẻ ra 6 job; hai job thừa
+# gửi đúng workflow vừa chạy xong → ComfyUI trả về từ CACHE
+# ("Prompt executed in 0.00 seconds"), `outputs` rỗng, và handler báo nhầm là
+# "SaveVideo bị mute". Tốn GPU thì không, nhưng làm hỏng bảng đo và mất 20 phút
+# đi tìm một lỗi không tồn tại.
+_idem: Dict[str, str] = {}
+
 
 def _new_job(payload: Dict[str, Any], webhook: Optional[str]) -> Dict[str, Any]:
     job_id = f"pod-{uuid.uuid4().hex}"
@@ -248,6 +259,18 @@ def _run_job(job: Dict[str, Any]) -> Dict[str, Any]:
 
     files = H.collect_outputs(entry, warnings)
     if not files:
+        # Phân biệt hai nguyên nhân rất khác nhau nhưng triệu chứng giống hệt.
+        # ComfyUI cache theo nội dung node: gửi lại ĐÚNG workflow vừa chạy thì
+        # không node nào chạy lại, `outputs` rỗng và log ghi
+        # "Prompt executed in 0.00 seconds". Báo "SaveVideo bị mute" ở đây là
+        # chỉ sai đường — đã mất công đi tìm một lỗi không tồn tại (22/08/2026).
+        if (time.time() - t_queue) < 5:
+            raise RuntimeError(
+                "ComfyUI trả kết quả từ CACHE (không node nào chạy lại) nên không có "
+                "file mới. Gần như chắc chắn đây là job TRÙNG — cùng workflow với job "
+                "vừa chạy xong. Kiểm tra client có gửi lặp không, và dùng header "
+                "Idempotency-Key để retry không đẻ job mới."
+            )
         raise RuntimeError(
             "Workflow chạy xong nhưng không sinh ra file output nào. "
             "Kiểm tra node SaveVideo có bị mute không."
@@ -429,12 +452,25 @@ class Api(BaseHTTPRequestHandler):
             return self._send(400, {"error": f"body không phải JSON hợp lệ: {e}"})
 
         if path in ("/run", "/runsync"):
+            # Gửi lại cùng một Idempotency-Key = cùng một job, không đẻ job mới.
+            # Client sinh key mỗi lần THỰC SỰ muốn chạy; retry thì giữ nguyên key.
+            idem = (self.headers.get("Idempotency-Key") or "").strip()
+            if idem:
+                with _jobs_lock:
+                    prev = _idem.get(idem)
+                if prev and prev in _jobs:
+                    log(f"idempotent: {idem[:12]}… → {prev} (không tạo job mới)")
+                    return self._send(200, {"id": prev, "status": _jobs[prev]["status"]})
+
             if _work.qsize() >= QUEUE_MAX:
                 # 503 chứ không phải nhận rồi chết sau: backend biết ngay để
                 # hoàn credit và báo user thử lại.
                 return self._send(503, {"error": f"hàng đợi đầy ({QUEUE_MAX} job)"})
 
             job = _new_job(body, body.get("webhook"))
+            if idem:
+                with _jobs_lock:
+                    _idem[idem] = job["id"]
             _work.put(job["id"])
             log(f"nhận {job['id']} (đợi {_work.qsize()})")
 

@@ -13,54 +13,111 @@
  * Đích (Pod hay Serverless) do scripts/endpoint.mjs quyết định theo .env.
  *
  * Biến môi trường:
- *   PRESET=turbo       bộ cấu hình. `turbo` (mặc định) = mốc hiện tại vs Turbo
- *                      LoRA 8 bước vs 4 bước 768p. `resolution` = bộ cũ quét
- *                      megapixels/steps của model gốc.
+ *   PRESET=mp          bộ cấu hình (mặc định `mp`):
+ *                      `mp`         = quét 1.0 → 0.4 MP với turbo LoRA.
+ *                                     ĐÂY LÀ BỘ NÊN CHẠY — số đo 22/08 cho thấy
+ *                                     điểm ảnh mới là biến chi phối, không phải
+ *                                     lượng tử hoá hay số bước.
+ *                      `nvfp4`      = fp8 vs NVFP4 vs NVFP4+LoRA vs fp8+LoRA
+ *                      `turbo`      = chỉ so LoRA, giữ weights fp8
+ *                      `resolution` = bộ cũ quét megapixels/steps
  *   SEED=42            mặc định 42 — cố định để so ảnh
  *   DURATION=10        áp cho mọi cấu hình
  *   ASPECT=...         áp cho mọi cấu hình
  *   COMPILE=1          bật torch.compile cho mọi cấu hình
  *   LORA=...           đổi tên file LoRA 8 bước
  *   LORA_4STEP=...     đổi tên file LoRA 4 bước 768p
+ *   UNET_FP8=... / UNET_NVFP4=...   đổi tên file diffusion model
  *   LORA_STRENGTH=1.0  áp cho mọi cấu hình có LoRA
  *   USD_PER_SEC=...    thêm cột $/video vào bảng. Pod 5090 = 0.000275,
  *                      Pod RTX PRO 6000 96GB = 0.00058, Serverless 5090 = 0.000439
  *   IMAGE=... IMAGE_LAST=...   chạy cả loạt ở chế độ I2V
  *   CONFIGS='[{...}]'  JSON thay hẳn bộ cấu hình. Mỗi phần tử nhận
- *                      { label, megapixels, steps, easycache, compile, lora }
+ *                      { label, megapixels, steps, easycache, compile, lora, unet }
  *   OUT=bench.json     nơi ghi kết quả thô (mặc định bench-results.json)
  *
- * Chi phí: mỗi cấu hình là một job thật. Bộ `turbo` 3 cấu hình ≈ 12–15 phút GPU,
- * bộ `resolution` 5 cấu hình ≈ 20–30 phút. Đọc kỹ bảng trước khi chạy lại.
+ * Chi phí: mỗi cấu hình là một job thật. Trên RTX 5090 ở 1MP, một job 8 bước mất
+ * ~6 phút; ở 0.4MP thì ngắn hơn nhiều. Bộ `mp` 4 cấu hình ≈ 15–18 phút GPU (~$0.28).
+ * Đọc kỹ bảng trước khi chạy lại.
  */
 import { readFile, writeFile } from "node:fs/promises";
 import { buildWorkflow } from "./build-workflow.mjs";
-import { BASE, HEADERS as H, TARGET, IS_POD, requireConfig, fetchRetry, sleep, health } from "./endpoint.mjs";
+import { BASE, HEADERS as H, TARGET, IS_POD, requireConfig, fetchRetry, sleep, health, submitJob } from "./endpoint.mjs";
 
 requireConfig();
 
-// Tên file LoRA turbo trên volume. Đổi ở đây, đừng rải vào từng cấu hình.
+// Tên file trên volume. Đổi ở đây, đừng rải vào từng cấu hình.
 const LORA_8 = process.env.LORA
   ?? "minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors";
 const LORA_4_768P = process.env.LORA_4STEP
-  ?? "minimax_h3_fl2v_turbo_4step_v1.0_768p_comfyui_bf16.safetensors";
+  ?? "minimax_h3_fl2v_turbo_4step_v1.1_768p_comfyui_bf16.safetensors";
+const UNET_FP8 = process.env.UNET_FP8
+  ?? "minimax_h3_fl2va_pruned_fp8_scaled.safetensors";
+const UNET_NVFP4 = process.env.UNET_NVFP4
+  ?? "minimax_h3_fl2va_pruned_nvfp4.safetensors";
 
 /**
- * Bộ mặc định (22/08/2026): trả lời đúng MỘT câu — "Turbo LoRA có đưa được
- * 338.8s về ~150s không, và mất bao nhiêu chất lượng".
+ * Bộ mặc định (sửa 22/08/2026 sau lần đo THẬT trên Pod RTX 5090).
  *
- * Cấu hình đầu là MỐC ĐANG CHẠY THẬT (14 bước + EasyCache 0.2, đo 19/08 = 338.8s).
- * Giữ nó ở vị trí đầu: bảng cuối tính "so với gốc" theo dòng này, và nếu số của
- * nó lệch nhiều so với 338.8s thì card hôm nay khác card hôm đó — biết ngay,
- * thay vì đoán mò như hai lần đo lệch 40% ngày 18–19/08.
+ * VÌ SAO ĐỔI: lần đo 22/08 20:35 trên 5090 ra **510s / 44.5 s mỗi bước thật** —
+ * trùng khít với lần 19/08 09:27 cũng trên 5090 (44.3 s/it). Tức mốc 338.8s
+ * trong bảng benchmark **KHÔNG PHẢI số của 5090** (log hôm đó không in tên card).
+ * Baseline thật của 5090 là ~44.5 s/bước.
+ *
+ * Hệ quả làm đảo thứ tự ưu tiên: ở 44.5 s/bước, Turbo LoRA 8 bước chỉ còn
+ * 8×44.5 = 356s sampling, so với 9 bước thật hôm nay là 400s — **LoRA một mình
+ * chỉ mua được ~44 giây**. Nút thắt không phải số bước, mà là 19983MB diffusion
+ * + 14956MB text encoder nhồi vào 31GB VRAM: aimdo stream liên tục.
+ * → NVFP4 (12.5GB) mới là đòn bẩy chính. Bộ này đo nó TRƯỚC.
+ *
+ * Mỗi dòng đổi ĐÚNG MỘT biến so với dòng trên, để quy được nguyên nhân:
+ *   1 → 2: chỉ đổi weights   (đo riêng NVFP4)
+ *   1 → 4: chỉ thêm LoRA     (đo riêng LoRA)
+ *   2 → 3: thêm LoRA lên NVFP4 (cấu hình đích)
  *
  * LoRA và EasyCache KHÔNG đi với nhau: ở 8 bước, hai bước liền nhau không còn
  * đủ giống để tái dùng. Vì thế mọi dòng LoRA đều `easycache: 0`.
  */
+const NVFP4_CONFIGS = [
+  { label: "mốc  fp8·14·EC",   unet: UNET_FP8,   megapixels: 1.0, steps: 14, easycache: 0.2 },
+  { label: "nvfp4·14·EC",      unet: UNET_NVFP4, megapixels: 1.0, steps: 14, easycache: 0.2 },
+  { label: "nvfp4·turbo8",     unet: UNET_NVFP4, megapixels: 1.0, steps: 8,  easycache: 0, lora: LORA_8 },
+  { label: "fp8·turbo8",       unet: UNET_FP8,   megapixels: 1.0, steps: 8,  easycache: 0, lora: LORA_8 },
+];
+
+/** Chỉ so LoRA, giữ nguyên weights fp8. Dùng: PRESET=turbo */
 const TURBO_CONFIGS = [
-  { label: "mốc 1MP·14·EC",    megapixels: 1.0, steps: 14, easycache: 0.2 },
-  { label: "turbo 1MP·8",      megapixels: 1.0, steps: 8,  easycache: 0, lora: LORA_8 },
-  { label: "turbo 1MP·4·768p", megapixels: 1.0, steps: 4,  easycache: 0, lora: LORA_4_768P },
+  { label: "mốc fp8·14·EC",    unet: UNET_FP8, megapixels: 1.0, steps: 14, easycache: 0.2 },
+  { label: "turbo 1MP·8",      unet: UNET_FP8, megapixels: 1.0, steps: 8,  easycache: 0, lora: LORA_8 },
+  { label: "turbo 1MP·4·768p", unet: UNET_FP8, megapixels: 1.0, steps: 4,  easycache: 0, lora: LORA_4_768P },
+];
+
+/**
+ * Quét ĐỘ PHÂN GIẢI — bộ quan trọng nhất sau lần đo 22/08/2026 21:15–21:28.
+ *
+ * Số liệu thật trên Pod RTX 5090, 1MP · 10s:
+ *   fp8·14·EC     staged 19983MB · 8 bước thật · 465.2s · ~44.5 s/bước
+ *   nvfp4·14·EC   staged 11944MB · 9 bước thật · 416.6s ·  40.9 s/bước
+ *   nvfp4·turbo8  staged 11944MB · 8 bước thật · 367.4s ·  41.3 s/bước
+ *
+ * Hai kết luận, cả hai đều BÁC BỎ giả thuyết trước đó:
+ *  1. NVFP4 nạp ĐÚNG (11944MB thay vì 19983MB) mà s/bước chỉ giảm 8%.
+ *     ⇒ nút thắt KHÔNG phải thrashing VRAM. Model nghẽn ở TÍNH TOÁN.
+ *  2. Turbo LoRA 8 bước cho đúng 8 lượt forward — bằng y hệt 14 bước + EasyCache
+ *     (skip 6, còn 8). ⇒ LoRA và EasyCache LÀM CÙNG MỘT VIỆC, cộng vào không lợi.
+ *
+ * Còn đúng một biến chưa động tới: SỐ ĐIỂM ẢNH. Bên ai-muninn đạt 175s/clip trên
+ * cùng RTX 5090 ở **864×480 = 0.41MP**, còn ta chạy 1MP (9:16 → ~768×1344) —
+ * gấp 2.5 lần điểm ảnh. 41 s/bước ÷ 2.5 ≈ 16 s/bước, vừa khớp con số của họ.
+ * Bộ này đo thẳng đường cong đó.
+ *
+ * Dùng: PRESET=mp
+ */
+const MP_CONFIGS = [
+  { label: "1.0MP·turbo8", unet: UNET_FP8, megapixels: 1.0, steps: 8, easycache: 0, lora: LORA_8 },
+  { label: "0.7MP·turbo8", unet: UNET_FP8, megapixels: 0.7, steps: 8, easycache: 0, lora: LORA_8 },
+  { label: "0.5MP·turbo8", unet: UNET_FP8, megapixels: 0.5, steps: 8, easycache: 0, lora: LORA_8 },
+  { label: "0.4MP·turbo8", unet: UNET_FP8, megapixels: 0.4, steps: 8, easycache: 0, lora: LORA_8 },
 ];
 
 /** Bộ cũ — quét độ phân giải/steps của model GỐC. Dùng: PRESET=resolution */
@@ -72,8 +129,8 @@ const RESOLUTION_CONFIGS = [
   { label: "0.5MP·12",    megapixels: 0.5,  steps: 12, easycache: 0.2 },
 ];
 
-const PRESETS = { turbo: TURBO_CONFIGS, resolution: RESOLUTION_CONFIGS };
-const PRESET = process.env.PRESET ?? "turbo";
+const PRESETS = { mp: MP_CONFIGS, nvfp4: NVFP4_CONFIGS, turbo: TURBO_CONFIGS, resolution: RESOLUTION_CONFIGS };
+const PRESET = process.env.PRESET ?? "mp";
 if (!process.env.CONFIGS && !PRESETS[PRESET]) {
   console.error(`✗ PRESET='${PRESET}' không có. Chọn: ${Object.keys(PRESETS).join(" | ")}`);
   process.exit(1);
@@ -95,6 +152,7 @@ async function runOne(baseWf, cfg, prompt) {
     // cfg.lora do bộ cấu hình quyết định; LORA_STRENGTH áp chung cho cả loạt
     // để mỗi lần bench chỉ đổi đúng một biến.
     loraStrength: cfg.loraStrength ?? process.env.LORA_STRENGTH,
+    unet: cfg.unet ?? process.env.UNET,
     firstFrame: process.env.IMAGE,
     lastFrame: process.env.IMAGE_LAST,
   });
@@ -102,18 +160,15 @@ async function runOne(baseWf, cfg, prompt) {
   console.log(`\n▶ ${cfg.label}`);
   console.log(`  ${label} · seed ${SEED}`);
 
-  const submit = await fetchRetry(`${BASE}/run`, {
-    method: "POST",
-    headers: H,
-    body: JSON.stringify({
+  let id;
+  try {
+    ({ id } = await submitJob({
       input: { workflow: wf, assets, meta: { jobId: cfg.label }, output_prefix: "videos/bench" },
       policy: { executionTimeout: 1_500_000, ttl: 3_600_000 },
-    }),
-  }, { label: "submit" });
-
-  if (!submit.ok) return { ok: false, error: `/run HTTP ${submit.status}: ${await submit.text()}` };
-
-  const { id } = await submit.json();
+    }));
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
   console.log(`  job ${id}`);
 
   const t0 = Date.now();
