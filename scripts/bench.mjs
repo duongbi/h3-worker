@@ -10,34 +10,61 @@
  * Vì sao dùng chung SEED và PROMPT cho mọi cấu hình: để so được CẢ tốc độ lẫn
  * chất lượng. Khác seed thì hai video khác nhau, không chấm được.
  *
+ * Đích (Pod hay Serverless) do scripts/endpoint.mjs quyết định theo .env.
+ *
  * Biến môi trường:
+ *   PRESET=turbo       bộ cấu hình. `turbo` (mặc định) = mốc hiện tại vs Turbo
+ *                      LoRA 8 bước vs 4 bước 768p. `resolution` = bộ cũ quét
+ *                      megapixels/steps của model gốc.
  *   SEED=42            mặc định 42 — cố định để so ảnh
  *   DURATION=10        áp cho mọi cấu hình
  *   ASPECT=...         áp cho mọi cấu hình
  *   COMPILE=1          bật torch.compile cho mọi cấu hình
+ *   LORA=...           đổi tên file LoRA 8 bước
+ *   LORA_4STEP=...     đổi tên file LoRA 4 bước 768p
+ *   LORA_STRENGTH=1.0  áp cho mọi cấu hình có LoRA
+ *   USD_PER_SEC=...    thêm cột $/video vào bảng. Pod 5090 = 0.000275,
+ *                      Pod RTX PRO 6000 96GB = 0.00058, Serverless 5090 = 0.000439
  *   IMAGE=... IMAGE_LAST=...   chạy cả loạt ở chế độ I2V
- *   CONFIGS='[{...}]'  JSON thay bộ cấu hình mặc định. Mỗi phần tử nhận
- *                      { label, megapixels, steps, easycache, compile }
+ *   CONFIGS='[{...}]'  JSON thay hẳn bộ cấu hình. Mỗi phần tử nhận
+ *                      { label, megapixels, steps, easycache, compile, lora }
  *   OUT=bench.json     nơi ghi kết quả thô (mặc định bench-results.json)
  *
- * Chi phí: mỗi cấu hình là một job thật. Bộ mặc định 5 cấu hình, ước chừng
- * 20–30 phút GPU. Đọc kỹ bảng trước khi chạy lại.
+ * Chi phí: mỗi cấu hình là một job thật. Bộ `turbo` 3 cấu hình ≈ 12–15 phút GPU,
+ * bộ `resolution` 5 cấu hình ≈ 20–30 phút. Đọc kỹ bảng trước khi chạy lại.
  */
 import { readFile, writeFile } from "node:fs/promises";
 import { buildWorkflow } from "./build-workflow.mjs";
+import { BASE, HEADERS as H, TARGET, IS_POD, requireConfig, fetchRetry, sleep, health } from "./endpoint.mjs";
 
-const API_KEY = process.env.RUNPOD_API_KEY;
-const ENDPOINT = process.env.RUNPOD_ENDPOINT_ID;
-if (!API_KEY || !ENDPOINT) {
-  console.error("✗ Thiếu RUNPOD_API_KEY hoặc RUNPOD_ENDPOINT_ID");
-  process.exit(1);
-}
-const BASE = `https://api.runpod.ai/v2/${ENDPOINT}`;
-const H = { Authorization: `Bearer ${API_KEY}`, "Content-Type": "application/json" };
+requireConfig();
 
-// Bộ mặc định: trả lời đúng câu "hạ độ phân giải và steps tới đâu thì còn đẹp".
-// Cấu hình đầu là mốc so sánh, giữ nguyên để mọi lần chạy đều có gốc.
-const DEFAULT_CONFIGS = [
+// Tên file LoRA turbo trên volume. Đổi ở đây, đừng rải vào từng cấu hình.
+const LORA_8 = process.env.LORA
+  ?? "minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors";
+const LORA_4_768P = process.env.LORA_4STEP
+  ?? "minimax_h3_fl2v_turbo_4step_v1.0_768p_comfyui_bf16.safetensors";
+
+/**
+ * Bộ mặc định (22/08/2026): trả lời đúng MỘT câu — "Turbo LoRA có đưa được
+ * 338.8s về ~150s không, và mất bao nhiêu chất lượng".
+ *
+ * Cấu hình đầu là MỐC ĐANG CHẠY THẬT (14 bước + EasyCache 0.2, đo 19/08 = 338.8s).
+ * Giữ nó ở vị trí đầu: bảng cuối tính "so với gốc" theo dòng này, và nếu số của
+ * nó lệch nhiều so với 338.8s thì card hôm nay khác card hôm đó — biết ngay,
+ * thay vì đoán mò như hai lần đo lệch 40% ngày 18–19/08.
+ *
+ * LoRA và EasyCache KHÔNG đi với nhau: ở 8 bước, hai bước liền nhau không còn
+ * đủ giống để tái dùng. Vì thế mọi dòng LoRA đều `easycache: 0`.
+ */
+const TURBO_CONFIGS = [
+  { label: "mốc 1MP·14·EC",    megapixels: 1.0, steps: 14, easycache: 0.2 },
+  { label: "turbo 1MP·8",      megapixels: 1.0, steps: 8,  easycache: 0, lora: LORA_8 },
+  { label: "turbo 1MP·4·768p", megapixels: 1.0, steps: 4,  easycache: 0, lora: LORA_4_768P },
+];
+
+/** Bộ cũ — quét độ phân giải/steps của model GỐC. Dùng: PRESET=resolution */
+const RESOLUTION_CONFIGS = [
   { label: "gốc 1MP·20",  megapixels: 1.0,  steps: 20, easycache: 0.2 },
   { label: "0.7MP·20",    megapixels: 0.7,  steps: 20, easycache: 0.2 },
   { label: "0.7MP·14",    megapixels: 0.7,  steps: 14, easycache: 0.2 },
@@ -45,29 +72,16 @@ const DEFAULT_CONFIGS = [
   { label: "0.5MP·12",    megapixels: 0.5,  steps: 12, easycache: 0.2 },
 ];
 
-const CONFIGS = process.env.CONFIGS ? JSON.parse(process.env.CONFIGS) : DEFAULT_CONFIGS;
+const PRESETS = { turbo: TURBO_CONFIGS, resolution: RESOLUTION_CONFIGS };
+const PRESET = process.env.PRESET ?? "turbo";
+if (!process.env.CONFIGS && !PRESETS[PRESET]) {
+  console.error(`✗ PRESET='${PRESET}' không có. Chọn: ${Object.keys(PRESETS).join(" | ")}`);
+  process.exit(1);
+}
+
+const CONFIGS = process.env.CONFIGS ? JSON.parse(process.env.CONFIGS) : PRESETS[PRESET];
 const SEED = Number(process.env.SEED ?? 42);
 const OUT = process.env.OUT ?? "bench-results.json";
-
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
-async function fetchRetry(url, opts = {}, { tries = 5, label = "request" } = {}) {
-  let lastErr;
-  for (let i = 1; i <= tries; i++) {
-    try {
-      return await fetch(url, opts);
-    } catch (e) {
-      lastErr = e;
-      const cause = e.cause?.code ?? e.cause?.errors?.[0]?.code ?? e.message;
-      if (i < tries) {
-        const wait = Math.min(2 ** i, 30);
-        console.log(`    ⚠ lỗi mạng khi ${label} (${cause}) — thử lại sau ${wait}s`);
-        await sleep(wait * 1000);
-      }
-    }
-  }
-  throw lastErr;
-}
 
 /** Gửi một job rồi chờ xong. Trả về {ok, executeMs, totalMs, url, error}. */
 async function runOne(baseWf, cfg, prompt) {
@@ -78,6 +92,9 @@ async function runOne(baseWf, cfg, prompt) {
     duration: process.env.DURATION ?? 10,
     aspect: process.env.ASPECT,
     compile: cfg.compile ?? process.env.COMPILE === "1",
+    // cfg.lora do bộ cấu hình quyết định; LORA_STRENGTH áp chung cho cả loạt
+    // để mỗi lần bench chỉ đổi đúng một biến.
+    loraStrength: cfg.loraStrength ?? process.env.LORA_STRENGTH,
     firstFrame: process.env.IMAGE,
     lastFrame: process.env.IMAGE_LAST,
   });
@@ -137,10 +154,25 @@ const prompt = process.argv[2] ??
 
 const baseWf = JSON.parse(await readFile(new URL("../workflows/h3_fl2va_api.json", import.meta.url), "utf8"));
 
-console.log(`Quét ${CONFIGS.length} cấu hình trên endpoint ${ENDPOINT}`);
+console.log(`Quét ${CONFIGS.length} cấu hình · ${TARGET}`);
 console.log(`prompt: ${prompt.slice(0, 70)}…`);
 console.log(`seed cố định: ${SEED}\n`);
-console.log("Chạy tuần tự. Cứ để đó, kết quả in dần.");
+
+// Hỏi /health TRƯỚC khi tốn tiền GPU. Trên Pod, dòng `GPU=<tên> <VRAM>GB` in ra
+// ở đây là thứ duy nhất cho phép về sau quy số đo về đúng card. Thiếu nó thì cả
+// loạt bench thành vô dụng — đúng bài học 18–19/08.
+try {
+  const h = await health();
+  if (IS_POD && !h.body?.comfy?.ok) {
+    console.error("\n✗ ComfyUI trên Pod chưa sẵn sàng. Dừng để khỏi đốt tiền GPU vô ích.");
+    process.exit(1);
+  }
+} catch (e) {
+  console.error(`✗ không hỏi được /health: ${e.message}`);
+  process.exit(1);
+}
+
+console.log("\nChạy tuần tự. Cứ để đó, kết quả in dần.");
 
 const results = [];
 for (const cfg of CONFIGS) {
@@ -159,20 +191,37 @@ for (const cfg of CONFIGS) {
 const okRuns = results.filter((r) => r.ok);
 const baseline = okRuns[0];
 
+// $/giây của card đang chạy — đặt để bảng có luôn cột $/video, con số thật sự
+// quyết định. Pod 5090 = 0.99/3600 = 0.000275 · Pod RTX PRO 6000 = 0.00058 ·
+// Serverless 5090 = 0.000439. Xem runpod.io/pricing.
+const USD_PER_SEC = Number(process.env.USD_PER_SEC ?? 0);
+
 console.log("\n\n=== KẾT QUẢ ===\n");
-console.log("| cấu hình | execute | so với gốc | video |");
-console.log("|---|---|---|---|");
+const money = USD_PER_SEC > 0;
+console.log(`| cấu hình | execute | s/bước | so với mốc |${money ? " $/video |" : ""} video |`);
+console.log(`|---|---|---|---|${money ? "---|" : ""}---|`);
 for (const r of results) {
   if (!r.ok) {
-    console.log(`| ${r.label} | LỖI | — | ${String(r.error).slice(0, 60)} |`);
+    console.log(`| ${r.label} | LỖI | — | — |${money ? " — |" : ""} ${String(r.error).slice(0, 60)} |`);
     continue;
   }
-  const s = (r.executeMs / 1000).toFixed(0) + "s";
+  const sec = r.executeMs / 1000;
   const rel = baseline && r !== baseline
     ? `${(r.executeMs / baseline.executeMs).toFixed(2)}×`
-    : "gốc";
-  console.log(`| ${r.label} | ${s} | ${rel} | ${r.url ?? ""} |`);
+    : "mốc";
+  // s/bước tính trên số bước ĐẶT, không phải số bước thật chạy (EasyCache bỏ
+  // bớt). Cột này để so LoRA-8-bước với gốc-14-bước cho công bằng.
+  const perStep = r.steps ? (sec / r.steps).toFixed(1) : "—";
+  // RunPod tính tiền từ lúc worker khởi động, nên cộng cả queueMs.
+  const cost = money
+    ? ` $${(USD_PER_SEC * ((r.executeMs + (r.queueMs ?? 0)) / 1000)).toFixed(3)} |`
+    : "";
+  console.log(`| ${r.label} | ${sec.toFixed(0)}s | ${perStep} | ${rel} |${cost} ${r.url ?? ""} |`);
 }
 
+if (!money) {
+  console.log("\n(Đặt USD_PER_SEC để có thêm cột $/video — ví dụ Pod 5090: USD_PER_SEC=0.000275)");
+}
 console.log(`\nKết quả thô: ${OUT}`);
 console.log("Giờ mở các link video xem cạnh nhau — bảng này chỉ nói tốc độ, không nói chất lượng.");
+console.log("Với cấu hình turbo, xem kỹ: chuyển động có mềm quá không, và AUDIO có méo không.");

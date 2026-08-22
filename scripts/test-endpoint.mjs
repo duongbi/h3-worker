@@ -4,7 +4,8 @@
  *   node --env-file=.env scripts/test-endpoint.mjs "prompt của bạn"
  *
  * Cần trong .env (hoặc export):
- *   RUNPOD_API_KEY, RUNPOD_ENDPOINT_ID
+ *   RUNPOD_API_KEY  +  RUNPOD_ENDPOINT_ID (Serverless)
+ *   RUNPOD_API_KEY  +  RUNPOD_BASE_URL    (Pod — xem scripts/endpoint.mjs)
  *
  * Tuỳ chọn qua biến môi trường:
  *   DURATION=10        số giây (4–15)
@@ -24,6 +25,12 @@
  *   EASYCACHE_START=0.15 / EASYCACHE_END=0.95   khoảng % số bước được phép tái dùng
  *   COMPILE=1          bật node TorchCompileModel (backend inductor)
  *
+ * Turbo LoRA (bản distill — đòn bẩy tốc độ lớn nhất):
+ *   LORA=minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors
+ *   LORA_STRENGTH=1.0  mặc định 1.0 · ảnh mềm→1.05–1.2 · ảnh gắt→0.8–0.95
+ *   Bật LoRA thì PHẢI đặt STEPS=8 (bản 768p: 4) và EASYCACHE=0.
+ *   Quên hạ STEPS = video vẫn ra nhưng hỏng, và không ai nghĩ tới cấu hình.
+ *
  *   Muốn quét nhiều cấu hình một lượt thì dùng scripts/bench.mjs.
  *
  * ⚠ Cú pháp đặt biến khác nhau theo shell:
@@ -34,48 +41,15 @@
  */
 import { readFile } from "node:fs/promises";
 import { buildWorkflow, cfgFromEnv } from "./build-workflow.mjs";
+import { BASE, HEADERS as H, TARGET, IS_POD, requireConfig, fetchRetry, sleep } from "./endpoint.mjs";
 
-const API_KEY = process.env.RUNPOD_API_KEY;
-const ENDPOINT = process.env.RUNPOD_ENDPOINT_ID;
-if (!API_KEY || !ENDPOINT) {
-  console.error("✗ Thiếu RUNPOD_API_KEY hoặc RUNPOD_ENDPOINT_ID");
-  process.exit(1);
-}
-const BASE = `https://api.runpod.ai/v2/${ENDPOINT}`;
-const H = { Authorization: `Bearer ${API_KEY}`, "Content-Type": "application/json" };
-
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
-/**
- * fetch có retry cho lỗi MẠNG (ETIMEDOUT, ECONNRESET, DNS...).
- *
- * Vì sao cần: một cú chớp mạng ở phía client từng giết cả script trong khi job
- * trên RunPod vẫn chạy bình thường — mất dấu job và tưởng là lỗi endpoint.
- * Lỗi HTTP (4xx/5xx) KHÔNG retry ở đây, để caller tự quyết.
- */
-async function fetchRetry(url, opts = {}, { tries = 5, label = "request" } = {}) {
-  let lastErr;
-  for (let i = 1; i <= tries; i++) {
-    try {
-      return await fetch(url, opts);
-    } catch (e) {
-      lastErr = e;
-      const cause = e.cause?.code ?? e.cause?.errors?.[0]?.code ?? e.message;
-      if (i < tries) {
-        const wait = Math.min(2 ** i, 30);
-        console.log(`  ⚠ lỗi mạng khi ${label} (${cause}) — thử lại sau ${wait}s [${i}/${tries - 1}]`);
-        await sleep(wait * 1000);
-      }
-    }
-  }
-  throw lastErr;
-}
+requireConfig();
 
 // ---- Gửi job (hoặc bám vào job đã có) ------------------------------------
 let id = process.env.JOB_ID;
 
 if (id) {
-  console.log(`→ endpoint  ${ENDPOINT}`);
+  console.log(`→ đích      ${TARGET}`);
   console.log(`→ bám vào job đã gửi: ${id}\n`);
 } else {
   const prompt = process.argv[2] ??
@@ -94,7 +68,7 @@ if (id) {
   const { wf, assets, label, seed } = built;
 
   const jobId = `test-${Date.now()}`;
-  console.log(`→ endpoint  ${ENDPOINT}`);
+  console.log(`→ đích      ${TARGET}`);
   console.log(`→ prompt    ${prompt.slice(0, 70)}…`);
   console.log(`→ cấu hình  ${label} · seed ${seed}`);
   if (assets.length) console.log(`→ ảnh vào   ${assets.map((a) => a.name).join(", ")}`);
@@ -115,7 +89,11 @@ if (id) {
   }
   ({ id } = await submit.json());
   console.log(`✓ đã submit, RunPod job id = ${id}`);
-  console.log("  Worker lạnh sẽ rất lâu (pull image + nạp 38GB weights + sampling).");
+  console.log(
+    IS_POD
+      ? "  Pod đã nóng sẵn — job đầu vẫn mất thêm ~1 phút để stream weights lần đầu."
+      : "  Worker lạnh sẽ rất lâu (pull image + nạp 38GB weights + sampling)."
+  );
   console.log(`  Mất kết nối cũng không sao — poll lại bằng:  JOB_ID=${id} node --env-file=.env scripts/test-endpoint.mjs\n`);
 }
 

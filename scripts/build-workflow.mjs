@@ -22,6 +22,7 @@ export const NODE = {
 };
 
 // ID cho node chèn thêm lúc chạy. Không được trùng ID có sẵn trong workflow.
+export const ACCEL_LORA = "acc:lora";
 export const ACCEL_COMPILE = "acc:compile";
 export const ACCEL_EASYCACHE = "acc:easycache";
 export const IMG_FIRST = "acc:first_frame";
@@ -108,6 +109,32 @@ export function buildWorkflow(baseWf, cfg = {}) {
   const accel = [];
   let modelRef = wf[NODE.GUIDER].inputs.model;
 
+  // ---- Turbo LoRA --------------------------------------------------------
+  // Bản distill của Lightx2v/ModelTC: 8 bước (hoặc 4 ở bản 768p) cho chất lượng
+  // xấp xỉ 20 bước gốc. Đây là đòn bẩy tốc độ lớn nhất, vì nó cắt thẳng số lần
+  // forward chứ không phải làm mỗi lần forward nhanh hơn.
+  //
+  // PHẢI đứng ĐẦU chuỗi: LoRA vá trọng số của model, còn compile/EasyCache thì
+  // bọc bên ngoài. Đảo thứ tự là compile một model rồi mới vá — ComfyUI sẽ
+  // phải biên dịch lại, hoặc tệ hơn là vá vào bản đã đóng băng.
+  //
+  // Nối cả vào BasicScheduler: node đó đọc `model_sampling` để dựng sigmas, và
+  // LoRA distill có thể đổi shift. Đây là ngoại lệ của ghi chú ngay phía trên —
+  // ta nối vì tính ĐÚNG sigmas, không phải vì tốc độ.
+  if (cfg.lora) {
+    wf[ACCEL_LORA] = {
+      class_type: "LoraLoaderModelOnly",
+      inputs: {
+        model: modelRef,
+        lora_name: cfg.lora,
+        strength_model: Number(cfg.loraStrength ?? 1.0),
+      },
+    };
+    modelRef = [ACCEL_LORA, 0];
+    wf[NODE.SCHEDULER].inputs.model = modelRef;
+    accel.push(`LoRA ${cfg.lora}@${Number(cfg.loraStrength ?? 1.0)}`);
+  }
+
   if (cfg.compile) {
     wf[ACCEL_COMPILE] = {
       class_type: "TorchCompileModel",
@@ -151,6 +178,9 @@ export function cfgFromEnv(env = process.env) {
     megapixels: env.MEGAPIXELS ?? 1,
     aspect: env.ASPECT,
     steps: env.STEPS,
+    // LORA="minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors" STEPS=8 EASYCACHE=0
+    lora: env.LORA,
+    loraStrength: env.LORA_STRENGTH,
     easycache: env.EASYCACHE ?? 0,
     easycacheStart: env.EASYCACHE_START,
     easycacheEnd: env.EASYCACHE_END,

@@ -123,6 +123,22 @@ COPY src/extra_model_paths.yaml /comfyui/extra_model_paths.yaml
 #   python -u /handler.py
 COPY src/handler.py /handler.py
 
+# ---- Chế độ POD ----------------------------------------------------------
+# CÙNG MỘT IMAGE chạy được cả Serverless lẫn Pod — chỉ khác lệnh khởi động.
+# Cố ý không tách image riêng cho Pod: hai image sẽ lệch nhau sau vài tuần, và
+# lúc đó mọi so sánh tốc độ giữa hai môi trường đều vô nghĩa.
+#
+#   Serverless : CMD mặc định bên dưới → /start.sh → ComfyUI + /handler.py
+#   Pod        : Container Start Command = `bash /pod-start.sh`
+#                → ComfyUI + /pod_server.py (giả lập API RunPod trên cổng 8000)
+#
+# ⚠ Cả hai file PHẢI được git theo dõi, nếu không build sẽ chết ở CI với
+#   "failed to compute cache key: not found" trong khi máy local vẫn có file.
+#   Kiểm tra: git check-ignore -q <file> && echo BI_IGNORE
+COPY src/pod_server.py    /pod_server.py
+COPY scripts/pod-start.sh /pod-start.sh
+RUN chmod +x /pod-start.sh
+
 # ---- Cấu hình mặc định ---------------------------------------------------
 ENV COMFY_HOST=127.0.0.1:8188 \
     COMFY_POLL_INTERVAL_MS=1000 \
@@ -130,6 +146,9 @@ ENV COMFY_HOST=127.0.0.1:8188 \
     OUTPUT_DIR=/comfyui/output \
     INPUT_DIR=/comfyui/input \
     R2_PUBLIC_BASE_URL="" \
-    R2_PRESIGN_EXPIRY_SEC=604800
+    R2_PRESIGN_EXPIRY_SEC=604800 \
+    POD_PORT=8000 \
+    POD_CONCURRENCY=1
 
+# Mặc định vẫn là Serverless. Pod override bằng Container Start Command.
 CMD ["/start.sh"]
