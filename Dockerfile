@@ -137,7 +137,8 @@ COPY src/handler.py /handler.py
 #   Kiểm tra: git check-ignore -q <file> && echo BI_IGNORE
 COPY src/pod_server.py    /pod_server.py
 COPY scripts/pod-start.sh /pod-start.sh
-RUN chmod +x /pod-start.sh
+COPY src/h3-entrypoint.sh /h3-entrypoint.sh
+RUN chmod +x /pod-start.sh /h3-entrypoint.sh
 
 # ---- Cấu hình mặc định ---------------------------------------------------
 ENV COMFY_HOST=127.0.0.1:8188 \
@@ -148,7 +149,11 @@ ENV COMFY_HOST=127.0.0.1:8188 \
     R2_PUBLIC_BASE_URL="" \
     R2_PRESIGN_EXPIRY_SEC=604800 \
     POD_PORT=8000 \
-    POD_CONCURRENCY=1
+    POD_CONCURRENCY=1 \
+    H3_MODE=serverless
 
-# Mặc định vẫn là Serverless. Pod override bằng Container Start Command.
-CMD ["/start.sh"]
+# Chọn chế độ bằng BIẾN MÔI TRƯỜNG H3_MODE, không bằng "Container Start Command"
+# của RunPod — ô đó đã một lần im lặng không áp dụng và Pod chạy nhầm handler
+# Serverless, restart 10 lần trong 45 giây (22/08/2026). Biến môi trường thì
+# luôn ăn. Để ô Container Start Command TRỐNG.
+CMD ["/h3-entrypoint.sh"]

@@ -47,6 +47,33 @@ if [ ${#missing[@]} -gt 0 ]; then
 fi
 [ -n "${POD_API_KEY:-}" ] || log "⚠ POD_API_KEY trống — cổng proxy của Pod là công khai."
 
+# ---- Driver của máy vs bản build của torch --------------------------------
+# torch cu130 đòi driver Linux >= 580.65.06. Máy RunPod còn r570/r575 sẽ chết
+# với "The NVIDIA driver on your system is too old (found version 12080)".
+# Thông báo đó chỉ sai đường ("liên hệ RunPod support") — thực ra chỉ là bốc
+# trúng máy cũ. In rõ ở đây để khỏi mất một vòng debug. Đã dính 22/08/2026.
+DRV="$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -1 || true)"
+TORCH_CUDA="$(python -c 'import torch;print(torch.version.cuda or "")' 2>/dev/null || true)"
+log "driver=${DRV:-không đọc được} · torch build cho CUDA ${TORCH_CUDA:-?}"
+
+case "$TORCH_CUDA" in
+  13*)
+    DRV_MAJOR="${DRV%%.*}"
+    if [ -n "$DRV_MAJOR" ] && [ "$DRV_MAJOR" -lt 580 ] 2>/dev/null; then
+        log "!! KHÔNG TƯƠNG THÍCH: torch build cho CUDA 13 nhưng driver $DRV < 580.65.06."
+        log "!! Máy này không chạy được image cu130. KHÔNG phải máy hỏng, đừng báo support."
+        log "!!"
+        log "!! Sửa cách 1 (nên làm): xoá Pod, deploy lại, mở Filters ở trang deploy và"
+        log "!!   chọn CUDA Versions = 13.0. Serverless của bạn vẫn chạy cu130 bình thường"
+        log "!!   nên DC này CÓ máy đủ driver — lần này chỉ là bốc trúng máy cũ."
+        log "!! Sửa cách 2 (khi DC hết máy CUDA 13.0): build ảnh dự phòng cu128 ở"
+        log "!!   GitHub → Actions → Build & Deploy h3-worker → Run workflow →"
+        log "!!   torch_channel = cu128, rồi dùng image tag <sha>-cu128. CHẬM HƠN cu130."
+        exit 1
+    fi
+    ;;
+esac
+
 # ---- ComfyUI --------------------------------------------------------------
 # --highvram: Pod sống lâu, giữ weights thường trú là mục đích chính của việc
 #   đổi sang Pod. Card 32GB không đủ chỗ thì BỎ cờ này (aimdo tự xoay), card
